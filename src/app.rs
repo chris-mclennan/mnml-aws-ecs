@@ -284,6 +284,66 @@ impl App {
             }
         }
     }
+
+    /// `R` — registry handoff. Reads the focused service's task
+    /// definition, finds the first container's image reference, and
+    /// spawns `mnml-aws-ecr` so the user can hop to "which image is
+    /// this service running?" Mirrors the ECS → ECR direction of the
+    /// container deploy flow. Sibling auto-scope to the specific
+    /// repository is v0.x — today the user navigates manually inside
+    /// the spawned mnml-aws-ecr.
+    pub fn handoff_ecr(&mut self) {
+        let Some(item) = self.focused_item() else {
+            self.status = "no item under cursor".into();
+            return;
+        };
+        let Item::Service(svc) = item else {
+            self.status = "R registry-jump is only available on services".into();
+            return;
+        };
+        let Some(td_ref) = svc.task_definition.clone() else {
+            self.status = "service has no task definition reference".into();
+            return;
+        };
+        let label = svc.name.clone();
+        let region = self.active().spec.region.clone();
+
+        let td = match ecs::describe_task_definition(&td_ref, region.as_deref()) {
+            Ok(td) => td,
+            Err(e) => {
+                self.status = format!("describe-task-definition: {e}");
+                return;
+            }
+        };
+        let Some(image) = td
+            .container_definitions
+            .iter()
+            .find_map(|c| c.image.clone())
+        else {
+            self.status = "no container image in task definition".into();
+            return;
+        };
+        // ECR image refs look like `<acct>.dkr.ecr.<region>.amazonaws.com/<repo>:<tag>`.
+        let repo_label = image
+            .split_once('/')
+            .map(|(_, rest)| rest.to_string())
+            .unwrap_or_else(|| image.clone());
+
+        let mut cmd = std::process::Command::new("mnml-aws-ecr");
+        if let Some(r) = &region {
+            cmd.args(["--region", r]);
+        }
+        match cmd.spawn() {
+            Ok(_) => {
+                self.status = format!(
+                    "launched mnml-aws-ecr — navigate to {repo_label} (service {label}, auto-scope is v0.x)"
+                );
+            }
+            Err(e) => {
+                self.status = format!("spawn mnml-aws-ecr failed (install it?): {e}");
+            }
+        }
+    }
 }
 
 #[cfg(test)]
