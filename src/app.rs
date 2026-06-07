@@ -235,6 +235,55 @@ impl App {
             Err(e) => self.status = format!("copy failed: {e}"),
         }
     }
+
+    /// `L` — describe the focused service's task definition, extract
+    /// the first awslogs CloudWatch group, then spawn
+    /// `mnml-aws-cloudwatch-logs --log-group <group>`. No-op when the
+    /// focus is a cluster (no task def at that level) or when the
+    /// task def has no awslogs driver (the user might be using splunk,
+    /// fluentd, or a sidecar shipper).
+    pub fn tail_logs(&mut self) {
+        let Some(item) = self.focused_item() else {
+            self.status = "no item under cursor".into();
+            return;
+        };
+        let Item::Service(svc) = item else {
+            self.status = "tail logs is only available on services".into();
+            return;
+        };
+        let Some(td_ref) = svc.task_definition.clone() else {
+            self.status = "service has no task definition reference".into();
+            return;
+        };
+        let label = svc.name.clone();
+        let region = self.active().spec.region.clone();
+
+        let td = match ecs::describe_task_definition(&td_ref, region.as_deref()) {
+            Ok(td) => td,
+            Err(e) => {
+                self.status = format!("describe-task-definition: {e}");
+                return;
+            }
+        };
+        let Some(log_group) = ecs::awslogs_group_for_task_def(&td) else {
+            self.status =
+                "no awslogs container in task definition — uses a non-CloudWatch driver".into();
+            return;
+        };
+
+        let mut cmd = std::process::Command::new("mnml-aws-cloudwatch-logs");
+        cmd.args(["--log-group", &log_group, "--log-group-name", &label]);
+        if let Some(r) = &region {
+            cmd.args(["--region", r]);
+        }
+        match cmd.spawn() {
+            Ok(_) => self.status = format!("tailing {log_group}"),
+            Err(e) => {
+                self.status =
+                    format!("spawn failed (install mnml-aws-cloudwatch-logs ≥ v0.2.0): {e}");
+            }
+        }
+    }
 }
 
 #[cfg(test)]

@@ -114,6 +114,55 @@ struct DescribeServicesResponse {
     services: Vec<Service>,
 }
 
+/// Subset of the TaskDefinition shape `aws ecs describe-task-definition`
+/// returns. We only care about the per-container log configuration —
+/// that's where the awslogs group lives.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TaskDefinition {
+    #[serde(rename = "family", default)]
+    pub family: Option<String>,
+    #[serde(rename = "revision", default)]
+    pub revision: Option<u32>,
+    #[serde(rename = "containerDefinitions", default)]
+    pub container_definitions: Vec<ContainerDefinition>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ContainerDefinition {
+    #[serde(rename = "name")]
+    pub name: String,
+    #[serde(rename = "image", default)]
+    pub image: Option<String>,
+    #[serde(rename = "logConfiguration", default)]
+    pub log_configuration: Option<LogConfiguration>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LogConfiguration {
+    #[serde(rename = "logDriver")]
+    pub log_driver: String,
+    #[serde(rename = "options", default)]
+    pub options: std::collections::HashMap<String, String>,
+}
+
+impl LogConfiguration {
+    /// `Some(group_name)` only when this container uses the `awslogs`
+    /// driver. The `awslogs-group` option holds the CloudWatch log
+    /// group name (e.g. `/ecs/api-service`).
+    pub fn awslogs_group(&self) -> Option<&str> {
+        if self.log_driver != "awslogs" {
+            return None;
+        }
+        self.options.get("awslogs-group").map(|s| s.as_str())
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct DescribeTaskDefinitionResponse {
+    #[serde(rename = "taskDefinition")]
+    task_definition: TaskDefinition,
+}
+
 /// Unified focused-item type so the renderer works across both
 /// `clusters` and `services` tabs.
 #[derive(Debug, Clone)]
@@ -306,6 +355,52 @@ pub fn task_definition_short(td: &str) -> String {
     td.rsplit('/').next().unwrap_or(td).to_string()
 }
 
+/// Run `aws ecs describe-task-definition --task-definition <ref>`. The
+/// `td_ref` argument accepts the same shapes ECS uses elsewhere —
+/// full ARN, `family:revision`, or just `family` (latest revision).
+pub fn describe_task_definition(td_ref: &str, region: Option<&str>) -> Result<TaskDefinition> {
+    let mut cmd = Command::new("aws");
+    cmd.args([
+        "ecs",
+        "describe-task-definition",
+        "--task-definition",
+        td_ref,
+        "--output",
+        "json",
+    ]);
+    if let Some(r) = region {
+        cmd.args(["--region", r]);
+    }
+    let output = cmd
+        .output()
+        .with_context(|| format!("spawn `aws ecs describe-task-definition` for {td_ref}"))?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(anyhow!(
+            "aws ecs describe-task-definition failed for {td_ref}: {}",
+            stderr.trim()
+        ));
+    }
+    let resp: DescribeTaskDefinitionResponse = serde_json::from_slice(&output.stdout)
+        .with_context(|| "parse describe-task-definition JSON")?;
+    Ok(resp.task_definition)
+}
+
+/// Find the first awslogs log group across the task definition's
+/// containers. If multiple containers each log to a different group,
+/// returns the first one — typical services have a single primary
+/// container or all containers shipped to the same group.
+pub fn awslogs_group_for_task_def(td: &TaskDefinition) -> Option<String> {
+    for c in &td.container_definitions {
+        if let Some(log) = &c.log_configuration
+            && let Some(g) = log.awslogs_group()
+        {
+            return Some(g.to_string());
+        }
+    }
+    None
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -389,6 +484,91 @@ mod tests {
         );
         assert_eq!(task_definition_short("api:42"), "api:42");
         assert_eq!(task_definition_short("api"), "api");
+    }
+
+    #[test]
+    fn parses_describe_task_definition_response() {
+        let json = r#"{
+            "taskDefinition": {
+                "family": "api",
+                "revision": 42,
+                "containerDefinitions": [
+                    {
+                        "name": "web",
+                        "image": "1.dkr.ecr.us-east-1.amazonaws.com/api:v1.2.3",
+                        "logConfiguration": {
+                            "logDriver": "awslogs",
+                            "options": {
+                                "awslogs-group": "/ecs/api-service",
+                                "awslogs-stream-prefix": "ecs",
+                                "awslogs-region": "us-east-1"
+                            }
+                        }
+                    }
+                ]
+            }
+        }"#;
+        let resp: DescribeTaskDefinitionResponse = serde_json::from_str(json).unwrap();
+        let td = resp.task_definition;
+        assert_eq!(td.family.as_deref(), Some("api"));
+        assert_eq!(td.revision, Some(42));
+        assert_eq!(td.container_definitions.len(), 1);
+        let log = td.container_definitions[0]
+            .log_configuration
+            .as_ref()
+            .expect("log config present");
+        assert_eq!(log.awslogs_group(), Some("/ecs/api-service"));
+    }
+
+    #[test]
+    fn awslogs_group_for_task_def_returns_first_match() {
+        let td = TaskDefinition {
+            family: Some("api".into()),
+            revision: Some(1),
+            container_definitions: vec![
+                ContainerDefinition {
+                    name: "sidecar".into(),
+                    image: None,
+                    log_configuration: None,
+                },
+                ContainerDefinition {
+                    name: "web".into(),
+                    image: None,
+                    log_configuration: Some(LogConfiguration {
+                        log_driver: "awslogs".into(),
+                        options: [("awslogs-group".to_string(), "/ecs/api".to_string())]
+                            .into_iter()
+                            .collect(),
+                    }),
+                },
+            ],
+        };
+        assert_eq!(awslogs_group_for_task_def(&td).as_deref(), Some("/ecs/api"));
+    }
+
+    #[test]
+    fn awslogs_group_returns_none_for_non_awslogs_drivers() {
+        let log = LogConfiguration {
+            log_driver: "splunk".into(),
+            options: [("awslogs-group".to_string(), "/ecs/api".to_string())]
+                .into_iter()
+                .collect(),
+        };
+        assert!(log.awslogs_group().is_none());
+    }
+
+    #[test]
+    fn awslogs_group_returns_none_when_no_containers_log_to_cloudwatch() {
+        let td = TaskDefinition {
+            family: None,
+            revision: None,
+            container_definitions: vec![ContainerDefinition {
+                name: "x".into(),
+                image: None,
+                log_configuration: None,
+            }],
+        };
+        assert!(awslogs_group_for_task_def(&td).is_none());
     }
 
     #[test]
