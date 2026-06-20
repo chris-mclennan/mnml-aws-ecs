@@ -55,6 +55,7 @@ pub async fn run(app: &mut App, socket: &Path) -> Result<()> {
             &mut *w,
             &Message::Hello {
                 version: PROTOCOL_VERSION,
+                caps: tmnl_protocol::Caps::empty(),
             },
         )
         .map_err(|e| anyhow!("blit: hello: {e}"))?;
@@ -170,6 +171,9 @@ pub async fn run(app: &mut App, socket: &Path) -> Result<()> {
                     }
                 }
                 Ok(InputEvent::Mouse(_)) => {}
+                // Focus / Hover / Ime and any future variants: ignored,
+                // same as Mouse above (this app has no clickable surfaces).
+                Ok(_) => {}
                 Err(TryRecvError::Empty) => break,
                 Err(TryRecvError::Disconnected) => return Ok(()),
             }
@@ -192,6 +196,8 @@ pub async fn run(app: &mut App, socket: &Path) -> Result<()> {
         let buf = terminal.backend().buffer();
         let bw = buf.area.width;
         let bh = buf.area.height;
+        // Pick up a live mnml theme switch before rebuilding the cell grid.
+        crate::theme::poll_refresh();
         let mut cells = Vec::with_capacity(bw as usize * bh as usize);
         for y in 0..bh {
             for x in 0..bw {
@@ -264,6 +270,7 @@ fn modifier_to_bits(m: Modifier) -> u32 {
 }
 
 fn color_to_rgba(c: Color, is_bg: bool) -> u32 {
+    let c = crate::theme::remap(c);
     match c {
         Color::Rgb(r, g, b) => pack_rgba_u8(r, g, b, 0xff),
         Color::Reset => {
